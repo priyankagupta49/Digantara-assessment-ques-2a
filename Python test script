@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+
+import pyvisa
+import time
+import csv
+import os
+import numpy as np
+
+VISA_PSU = "GPIB0::22::INSTR"
+VISA_LOAD = "GPIB0::26::INSTR"
+VISA_SCOPE = "USB0::0x0957::0x17A6::MY12345678::0::INSTR"
+
+RAIL_TARGET = 3.3
+V_MIN_LIMIT = RAIL_TARGET * 0.95
+V_MAX_LIMIT = RAIL_TARGET * 1.05
+
+def initialize_instruments():
+    rm = pyvisa.ResourceManager()
+    try:
+        psu = rm.open_resource(VISA_PSU)
+        eload = rm.open_resource(VISA_LOAD)
+        scope = rm.open_resource(VISA_SCOPE)
+
+        psu.timeout = 5000
+        eload.timeout = 5000
+        scope.timeout = 10000
+
+        return psu, eload, scope
+    except pyvisa.VisaIOError as e:
+        print(f"Instrument connection error: {e}")
+        raise
+
+def run_transient_test():
+    psu, eload, scope = initialize_instruments()
+
+    psu.write("*RST")
+    eload.write("*RST")
+    scope.write("*RST")
+    time.sleep(1)
+
+    psu.write("INST:SEL CH1")
+    psu.write("VOLT 5.0")
+    psu.write("CURR 3.0")
+
+    eload.write("FUNC CURR")
+    eload.write("CURR:TRAN:MODE PULS")
+    eload.write("CURR:TRAN:ALEV 0.3")
+    eload.write("CURR:TRAN:BLEV 2.4")
+    eload.write("CURR:TRAN:TWID 500us")
+
+    scope.write(":CHANNEL1:DISPLAY ON")
+    scope.write(":CHANNEL1:RANGE 1.0V")
+    scope.write(":CHANNEL1:OFFSET 3.3V")
+    scope.write(":TIMEBASE:RANGE 2ms")
+    scope.write(":TRIGGER:MODE EDGE")
+    scope.write(":TRIGGER:EDGE:SOURCE CHANNEL1")
+    scope.write(":TRIGGER:EDGE:SLOPE FALLING")
+    scope.write(":TRIGGER:LEVEL 3.2V")
+
+    psu.write("OUTP ON")
+    time.sleep(0.5)
+    eload.write("OUTP ON")
+    eload.write("CURR:TRAN:STAT ON")
+    time.sleep(0.2)
+
+    measurements = []
+    iterations = 10
+
+    for i in range(iterations):
+        scope.write(":DIGITIZE CHANNEL1")
+
+        v_max = float(scope.query(":MEASURE:VMAX? CHANNEL1").strip())
+        v_min = float(scope.query(":MEASURE:VMIN? CHANNEL1").strip())
+
+        passed = (v_min >= V_MIN_LIMIT) and (v_max <= V_MAX_LIMIT)
+        status = "PASS" if passed else "FAIL"
+
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+        measurements.append({
+            "Iteration": i + 1,
+            "Timestamp": timestamp,
+            "V_Min(V)": round(v_min, 4),
+            "V_Max(V)": round(v_max, 4),
+            "Status": status
+        })
+
+        scope.write(f':DISK:SAVE:WAVEFORM CHANNEL1, "Waveform_Iter_{i+1}.csv", CSV, OVERWRITE')
+        time.sleep(0.1)
+
+    eload.write("OUTP OFF")
+    psu.write("OUTP OFF")
+
+    v_mins = [m["V_Min(V)"] for m in measurements]
+    v_maxs = [m["V_Max(V)"] for m in measurements]
+
+    stats = {
+        "Mean_VMin": round(np.mean(v_mins), 4),
+        "Std_VMin": round(np.std(v_mins), 4),
+        "Mean_VMax": round(np.mean(v_maxs), 4),
+        "Std_VMax": round(np.std(v_maxs), 4)
+    }
+
+    csv_filename = "PDN_Transient_Report.csv"
+
+    with open(csv_filename, mode='w', newline='') as f:
+        writer = csv.writer(f)
+
+        writer.writerow(["--- TRANSIENT LOAD TEST LOG ---"])
+        writer.writerow(["Iteration", "Timestamp", "V_Min (V)", "V_Max (V)", "Status"])
+
+        for m in measurements:
+            writer.writerow([
+                m["Iteration"],
+                m["Timestamp"],
+                m["V_Min(V)"],
+                m["V_Max(V)"],
+                m["Status"]
+            ])
+
+        writer.writerow([])
+        writer.writerow(["--- STATISTICAL ANALYSIS ---"])
+        writer.writerow(["Metric", "Value"])
+        writer.writerow(["Mean V_Min", stats["Mean_VMin"]])
+        writer.writerow(["Std Dev V_Min", stats["Std_VMin"]])
+        writer.writerow(["Mean V_Max", stats["Mean_VMax"]])
+        writer.writerow(["Std Dev V_Max", stats["Std_VMax"]])
+
+    print(f"Testing execution completed successfully. Log saved to: {csv_filename}")
+
+if __name__ == "__main__":
+    run_transient_test()
